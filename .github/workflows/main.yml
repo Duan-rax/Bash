@@ -1,46 +1,52 @@
-name: Auto Compile MRS Ruleset
+name: Mihomo Ruleset Compiler
 on:
   push:
     paths:
-      - 'rules/*.txt' # 建议把源文件放在 rules 文件夹下
-  workflow_dispatch:
+      - 'rules/**' # 只要 rules 文件夹下的文件有变动就触发
+  workflow_dispatch: # 支持手动点击按钮运行
 
 jobs:
-  build:
+  compile:
     runs-on: ubuntu-latest
-    permissions: # 赋予发布权限
+    permissions:
       contents: write
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Mihomo
+      - name: Get Mihomo Binary
         run: |
+          # 自动获取最新版 Mihomo
           VERSION=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep tag_name | cut -d '"' -f 4)
           wget https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/mihomo-linux-amd64-${VERSION}.gz
           gunzip mihomo-linux-amd64-${VERSION}.gz
           chmod +x mihomo-linux-amd64-${VERSION}
           mv mihomo-linux-amd64-${VERSION} mihomo
 
-      - name: Batch Compile Rules
+      - name: Process and Compile
         run: |
           mkdir -p output
+          # 遍历 rules 目录下所有的 .txt 文件
           for file in rules/*.txt; do
+            [ -e "$file" ] || continue
             filename=$(basename "$file" .txt)
-            echo "Compiling $filename..."
-            # 自动判断：如果文件包含 IP 段则用 ipset，否则用 domain
+            echo "Building $filename.mrs..."
+
+            # 关键修复：使用强制格式转换，避免进入代理模式
+            # 如果文件中包含冒号或点号组成的 IP 模式，则作为 ipset 编译，否则作为 domain
             if grep -E "([0-9]{1,3}\.){3}[0-9]{1,3}" "$file" > /dev/null; then
-              ./mihomo convert ruleset ipset "$file" "output/${filename}.mrs"
+              ./mihomo convert ruleset ipset "$file" "./output/${filename}.mrs"
             else
-              ./mihomo convert ruleset domain "$file" "output/${filename}.mrs"
+              ./mihomo convert ruleset domain "$file" "./output/${filename}.mrs"
             fi
           done
 
-      - name: Upload to Release
+      - name: Release MRS Files
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           files: output/*.mrs
+          body: "Last updated on $(date +'%Y-%m-%d %H:%M:%S')"
           overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
