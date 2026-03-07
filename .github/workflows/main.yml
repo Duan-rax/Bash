@@ -1,4 +1,4 @@
-name: Mihomo Ruleset Compiler
+name: Mihomo MRS Compiler
 on:
   push:
     paths:
@@ -6,48 +6,45 @@ on:
   workflow_dispatch:
 
 jobs:
-  compile:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Get Mihomo Binary
         run: |
-          # 明确指定版本，避免获取到有 Bug 的预发布版
-          wget https://github.com/MetaCubeX/mihomo/releases/download/v1.18.3/mihomo-linux-amd64-v1.18.3.gz
-          gunzip mihomo-linux-amd64-v1.18.3.gz
-          mv mihomo-linux-amd64-v1.18.3 mihomo
+          # 获取最新 Alpha 或 Stable 版本，确保支持 convert-ruleset
+          VERSION=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep tag_name | cut -d '"' -f 4)
+          wget https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/mihomo-linux-amd64-${VERSION}.gz
+          gunzip mihomo-linux-amd64-${VERSION}.gz
+          mv mihomo-linux-amd64-${VERSION} mihomo
           chmod +x mihomo
 
-      - name: Process and Compile
+      - name: Compile Rules
         run: |
           mkdir -p output
-          # 遍历 rules 目录
-          for file in rules/*.txt; do
+          for file in rules/*.yaml; do
             [ -e "$file" ] || continue
-            filename=$(basename "$file" .txt)
-            echo "Building $filename.mrs from $file..."
+            filename=$(basename "$file" .yaml)
+            echo "Converting $filename to MRS..."
             
-            # 【关键修改】：使用更加明确的绝对路径和子命令格式
-            # 强制使用 domain 模式转换
-            ./mihomo -f "$file" convert ruleset domain "$file" "./output/${filename}.mrs"
-            
-            # 如果上面命令报错或产生阻塞，下面的检测会起作用
-            if [ ! -f "./output/${filename}.mrs" ]; then
-              echo "Compilation failed for $filename"
-              exit 1
+            # 使用你查到的最新指令格式
+            # 逻辑：判断文件名或内容，默认使用 domain 转换
+            if [[ "$filename" == *"ip"* ]]; then
+              ./mihomo convert-ruleset ipcidr yaml "$file" "output/${filename}.mrs"
+            else
+              ./mihomo convert-ruleset domain yaml "$file" "output/${filename}.mrs"
             fi
           done
 
-      - name: Release MRS Files
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           files: output/*.mrs
-          body: "Rules compiled at $(date +'%Y-%m-%d %H:%M:%S')"
           overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
