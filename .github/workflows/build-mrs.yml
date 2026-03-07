@@ -5,6 +5,9 @@ on:
     paths:
       - "rules/**"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,20 +22,27 @@ jobs:
         chmod +x mihomo-linux-amd64
         sudo mv mihomo-linux-amd64 /usr/local/bin/mihomo
 
-    - name: Create mrs directory
+    - name: Prepare directory
       run: mkdir -p mrs
 
-    - name: Convert rules to MRS
+    - name: Convert YAML to MRS
       run: |
         for file in rules/*.yaml; do
           name=$(basename "$file" .yaml)
-          mihomo convert-ruleset domain yaml "$file" "mrs/$name.mrs"
+
+          if grep -q "IP-CIDR" "$file"; then
+            type="ipcidr"
+          else
+            type="domain"
+          fi
+
+          mihomo convert-ruleset $type yaml "$file" "mrs/$name.mrs"
         done
 
-    - name: Commit MRS files
+    - name: Commit MRS
       run: |
-        git config --global user.name "github-actions"
-        git config --global user.email "actions@github.com"
+        git config --global user.name github-actions
+        git config --global user.email github-actions@github.com
         git add mrs/*.mrs
         git commit -m "Auto build MRS" || echo "No changes"
         git push
