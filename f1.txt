@@ -1,0 +1,6 @@
+payload:
+  - '+.formula1.com'
+  - '+.f1prospectus.com'
+  - '+.f1-ott.com'
+  - '+.f1-live-gp.com'
+  - 'ott-video-cf.formula1.com'
