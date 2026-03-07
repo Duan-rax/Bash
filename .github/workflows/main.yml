@@ -1,0 +1,34 @@
+name: Compile MRS
+on:
+  push:
+    paths:
+      - '**.txt' # 当 txt 文件变动时触发
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Mihomo
+        run: |
+          wget https://github.com/MetaCubeX/mihomo/releases/download/v1.18.3/mihomo-linux-amd64-v1.18.3.gz
+          gunzip mihomo-linux-amd64-v1.18.3.gz
+          chmod +x mihomo-linux-amd64-v1.18.3
+          mv mihomo-linux-amd64-v1.18.3 mihomo
+
+      - name: Compile Rules
+        run: |
+          # 将 f1.txt 编译为 f1.mrs
+          ./mihomo convert ruleset domain f1.txt f1.mrs
+
+      - name: Release MRS
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          files: f1.mrs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
