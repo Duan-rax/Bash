@@ -1,34 +1,46 @@
-name: Compile MRS
+name: Auto Compile MRS Ruleset
 on:
   push:
     paths:
-      - '**.txt' # 当 txt 文件变动时触发
-  workflow_dispatch: # 允许手动触发
+      - 'rules/*.txt' # 建议把源文件放在 rules 文件夹下
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions: # 赋予发布权限
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Mihomo
+      - name: Install Mihomo
         run: |
-          wget https://github.com/MetaCubeX/mihomo/releases/download/v1.18.3/mihomo-linux-amd64-v1.18.3.gz
-          gunzip mihomo-linux-amd64-v1.18.3.gz
-          chmod +x mihomo-linux-amd64-v1.18.3
-          mv mihomo-linux-amd64-v1.18.3 mihomo
+          VERSION=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep tag_name | cut -d '"' -f 4)
+          wget https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/mihomo-linux-amd64-${VERSION}.gz
+          gunzip mihomo-linux-amd64-${VERSION}.gz
+          chmod +x mihomo-linux-amd64-${VERSION}
+          mv mihomo-linux-amd64-${VERSION} mihomo
 
-      - name: Compile Rules
+      - name: Batch Compile Rules
         run: |
-          # 将 f1.txt 编译为 f1.mrs
-          ./mihomo convert ruleset domain f1.txt f1.mrs
+          mkdir -p output
+          for file in rules/*.txt; do
+            filename=$(basename "$file" .txt)
+            echo "Compiling $filename..."
+            # 自动判断：如果文件包含 IP 段则用 ipset，否则用 domain
+            if grep -E "([0-9]{1,3}\.){3}[0-9]{1,3}" "$file" > /dev/null; then
+              ./mihomo convert ruleset ipset "$file" "output/${filename}.mrs"
+            else
+              ./mihomo convert ruleset domain "$file" "output/${filename}.mrs"
+            fi
+          done
 
-      - name: Release MRS
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          files: f1.mrs
+          files: output/*.mrs
+          overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
