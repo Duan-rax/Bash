@@ -16,29 +16,34 @@ jobs:
 
       - name: Get Mihomo Binary
         run: |
-          # 获取最新 Alpha 或 Stable 版本，确保支持 convert-ruleset
           VERSION=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep tag_name | cut -d '"' -f 4)
           wget https://github.com/MetaCubeX/mihomo/releases/download/${VERSION}/mihomo-linux-amd64-${VERSION}.gz
           gunzip mihomo-linux-amd64-${VERSION}.gz
           mv mihomo-linux-amd64-${VERSION} mihomo
           chmod +x mihomo
 
-      - name: Compile Rules
+      - name: Download and Compile
         run: |
           mkdir -p output
-          for file in rules/*.yaml; do
-            [ -e "$file" ] || continue
-            filename=$(basename "$file" .yaml)
-            echo "Converting $filename to MRS..."
-            
-            # 使用你查到的最新指令格式
-            # 逻辑：判断文件名或内容，默认使用 domain 转换
-            if [[ "$filename" == *"ip"* ]]; then
-              ./mihomo convert-ruleset ipcidr yaml "$file" "output/${filename}.mrs"
-            else
+          # 1. 如果你有本地 rules 文件夹里的文件，先转换它们
+          if [ -d "rules" ]; then
+            for file in rules/*.yaml; do
+              [ -e "$file" ] || continue
+              filename=$(basename "$file" .yaml)
               ./mihomo convert-ruleset domain yaml "$file" "output/${filename}.mrs"
-            fi
-          done
+            done
+          fi
+
+          # 2. 如果你想从远程 URL 下载并转换 (以 F1 规则为例)
+          # 我们先下载到本地 f1_remote.yaml
+          curl -sL "https://raw.githubusercontent.com/v2fly/domain-list-community/master/data/formula1" -o f1_raw.txt
+          
+          # 因为 v2fly 的原始格式不是标准的 payload 格式，我们需要简单处理一下
+          echo "payload:" > f1_fixed.yaml
+          sed 's/^/  - /' f1_raw.txt >> f1_fixed.yaml
+          
+          # 执行转换
+          ./mihomo convert-ruleset domain yaml f1_fixed.yaml "output/formula1.mrs"
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
