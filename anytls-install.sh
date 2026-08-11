@@ -117,6 +117,9 @@ do_uninstall() {
   warn "即将卸载 sing-box 与相关配置。"
   confirm "确认继续？" n || { echo "已取消。"; exit 0; }
   systemctl disable --now sing-box 2>/dev/null || true
+  systemctl disable --now acme-renew.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/acme-renew.service /etc/systemd/system/acme-renew.timer
+  systemctl daemon-reload 2>/dev/null || true
   apt-get purge -y sing-box 2>/dev/null || true
   rm -f /usr/local/bin/anytls
   if confirm "同时删除 $CONF_DIR（含证书与配置）？" n; then
@@ -145,10 +148,7 @@ hr
 info "安装基础依赖…"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-# cron 是必需的：acme.sh 在没有 crontab 的机器上会拒绝安装（无法自动续期）
-apt-get install -y -qq curl ca-certificates openssl socat jq dnsutils iproute2 qrencode cron >/dev/null
-systemctl enable --now cron >/dev/null 2>&1 || true
-command -v crontab >/dev/null || die "crontab 不可用，acme.sh 无法配置自动续期。"
+apt-get install -y -qq curl ca-certificates openssl socat jq dnsutils iproute2 qrencode >/dev/null
 ok "依赖就绪"
 
 # 取本机公网 IP
@@ -329,11 +329,16 @@ fi
 if [[ "$CERT_MODE" != "3" ]]; then
   install -d -m 755 "$CERT_DIR"
 
-  # 上一次安装可能中途失败留下残缺目录，用能否正常执行来判断而非只看文件存在
+  # acme.sh 默认要求系统有 crontab，精简版 Debian 镜像常常没有。
+  # 这里统一用 --nocron 安装，续期改由下面创建的 systemd timer 驱动。
   if ! ( [[ -x "$ACME" ]] && "$ACME" --version >/dev/null 2>&1 ); then
     info "安装 acme.sh…"
     rm -rf "$HOME/.acme.sh"
-    curl -fsSL https://get.acme.sh | sh -s email="$EMAIL" >/dev/null
+    curl -fsSL https://get.acme.sh -o /tmp/get-acme.sh || die "无法下载 acme.sh 安装脚本。"
+    sh /tmp/get-acme.sh --nocron email="$EMAIL" >/dev/null 2>&1 \
+      || sh /tmp/get-acme.sh --nocron --force email="$EMAIL" >/dev/null 2>&1 \
+      || { sh /tmp/get-acme.sh --nocron --force email="$EMAIL"; }
+    rm -f /tmp/get-acme.sh
     [[ -x "$ACME" ]] || die "acme.sh 安装失败，请检查上面的输出。"
   fi
   "$ACME" --set-default-ca --server letsencrypt >/dev/null
@@ -365,7 +370,36 @@ if [[ "$CERT_MODE" != "3" ]]; then
     --key-file       "$KEY_FILE" \
     --reloadcmd      "systemctl restart sing-box" >/dev/null
   fix_perms "$CERT_FILE" "$KEY_FILE"
-  ok "证书就绪（到期前会自动续期并重启服务）"
+
+  # 用 systemd timer 代替 cron 驱动续期，每天随机时间跑一次，
+  # 到期前 30 天 acme.sh 会自动续并执行 reloadcmd 重启 sing-box。
+  info "配置证书自动续期 timer…"
+  cat > /etc/systemd/system/acme-renew.service <<EOF
+[Unit]
+Description=Renew ACME certificates (acme.sh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$ACME --cron --home $HOME/.acme.sh
+EOF
+  cat > /etc/systemd/system/acme-renew.timer <<'EOF'
+[Unit]
+Description=Daily ACME certificate renewal
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now acme-renew.timer >/dev/null 2>&1 \
+    || warn "acme-renew.timer 启用失败，请手动检查。"
+  ok "证书就绪（acme-renew.timer 每日检查，到期自动续并重启服务）"
 else
   # 用户自带证书，同样要保证服务用户可读
   fix_perms "$CERT_FILE" "$KEY_FILE"
@@ -475,8 +509,8 @@ $(jq -n --arg n "$NODE_NAME" --arg s "$DOMAIN" --arg pw "$PASSWORD" --argjson p 
 
 ── 提示 ────────────────────────────────────────────────
   · 客户端只开 UDP 转发；连接复用(mux)、TCP Fast Open 必须关闭
-  · 证书由 acme.sh 自动续期并重启 sing-box，无需手动干预
-  · 管理命令： anytls {info|qr|log|restart|update|uninstall}
+  · 证书由 acme-renew.timer 每日检查、自动续期并重启 sing-box
+  · 管理命令： anytls {info|qr|log|cert|restart|update|uninstall}
 ════════════════════════════════════════════════════════
 EOF
 chmod 600 "$INFO_FILE"
@@ -491,15 +525,19 @@ case "\${1:-info}" in
   link)      cat $LINK_FILE ;;
   qr)        qrencode -t ANSIUTF8 < $LINK_FILE ;;
   log)       journalctl -u sing-box -n 100 --no-pager -f ;;
+  cert)      echo "到期时间: \$(openssl x509 -in $CERT_FILE -noout -enddate | cut -d= -f2)"
+             systemctl list-timers acme-renew.timer --no-pager 2>/dev/null || true ;;
   restart)   systemctl restart sing-box && systemctl --no-pager status sing-box ;;
   status)    systemctl --no-pager status sing-box ;;
   update)    apt-get update -qq && apt-get install -y --only-upgrade sing-box && systemctl restart sing-box && sing-box version ;;
   renew)     "$ACME" --renew -d "$DOMAIN" --ecc --force ;;
-  uninstall) systemctl disable --now sing-box 2>/dev/null || true
+  uninstall) systemctl disable --now sing-box acme-renew.timer 2>/dev/null || true
              apt-get purge -y sing-box 2>/dev/null || true
+             rm -f /etc/systemd/system/acme-renew.{service,timer}
+             systemctl daemon-reload
              rm -rf $CONF_DIR /usr/local/bin/anytls
              echo "已卸载（acme.sh 保留，如需删除：\$HOME/.acme.sh/acme.sh --uninstall）" ;;
-  *)         echo "用法: anytls {info|link|qr|log|status|restart|update|renew|uninstall}" ;;
+  *)         echo "用法: anytls {info|link|qr|log|cert|status|restart|update|renew|uninstall}" ;;
 esac
 EOF
 chmod +x /usr/local/bin/anytls
