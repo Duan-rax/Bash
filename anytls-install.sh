@@ -145,11 +145,65 @@ echo "${BD}  AnyTLS · sing-box 安装脚本${N}"
 echo "${D}  Debian / 真实证书 / 自动续期${N}"
 hr
 
-info "安装基础依赖…"
+hr
+info "检查并安装依赖…"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq curl ca-certificates openssl socat jq dnsutils iproute2 qrencode >/dev/null
-ok "依赖就绪"
+apt-get update -qq || die "apt-get update 失败，请检查网络或软件源。"
+
+# 格式为「包名:用于验证的命令」，命令为空表示只校验包是否已安装
+DEPS=(
+  "curl:curl"
+  "ca-certificates:"
+  "openssl:openssl"
+  "socat:socat"
+  "jq:jq"
+  "dnsutils:dig"
+  "iproute2:ss"
+  "qrencode:qrencode"
+  "cron:crontab"          # acme.sh 自动续期需要 crontab
+)
+
+dep_ok() { # dep_ok <包名> <命令>
+  if [[ -z "$2" ]]; then dpkg -s "$1" >/dev/null 2>&1; else command -v "$2" >/dev/null 2>&1; fi
+}
+
+MISSING=()
+for item in "${DEPS[@]}"; do
+  dep_ok "${item%%:*}" "${item#*:}" || MISSING+=("${item%%:*}")
+done
+
+if (( ${#MISSING[@]} > 0 )); then
+  info "缺失组件：${MISSING[*]}，开始安装…"
+  # 故意不静默：装不上时需要看到 apt 的真实报错
+  apt-get install -y "${MISSING[@]}" || warn "部分依赖安装返回非零，下面逐项复核。"
+fi
+
+# 复核：区分「致命缺失」与「可降级缺失」
+FATAL=()
+ACME_NOCRON=0
+for item in "${DEPS[@]}"; do
+  pkg=${item%%:*}; cmd=${item#*:}
+  dep_ok "$pkg" "$cmd" && continue
+  if [[ "$pkg" == "cron" ]]; then
+    ACME_NOCRON=1
+    warn "cron 安装失败，证书续期将降级为 systemd timer（功能等价）。"
+  else
+    FATAL+=("$pkg${cmd:+ (缺少 $cmd)}")
+  fi
+done
+(( ${#FATAL[@]} > 0 )) && die "以下依赖无法安装：${FATAL[*]}"
+
+if (( ACME_NOCRON == 0 )); then
+  systemctl enable --now cron >/dev/null 2>&1 || true
+  if systemctl is-active --quiet cron; then
+    ok "依赖就绪（cron 已启动，证书续期走 crontab）"
+  else
+    ACME_NOCRON=1
+    warn "cron 已安装但服务未运行，证书续期改用 systemd timer。"
+  fi
+else
+  ok "依赖就绪"
+fi
 
 # 取本机公网 IP
 SERVER_IP4=$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
@@ -329,17 +383,19 @@ fi
 if [[ "$CERT_MODE" != "3" ]]; then
   install -d -m 755 "$CERT_DIR"
 
-  # acme.sh 默认要求系统有 crontab，精简版 Debian 镜像常常没有。
-  # 这里统一用 --nocron 安装，续期改由下面创建的 systemd timer 驱动。
+  # 上次安装可能中途失败留下残缺目录，用能否正常执行判断，而非只看文件存在
   if ! ( [[ -x "$ACME" ]] && "$ACME" --version >/dev/null 2>&1 ); then
     info "安装 acme.sh…"
     rm -rf "$HOME/.acme.sh"
     curl -fsSL https://get.acme.sh -o /tmp/get-acme.sh || die "无法下载 acme.sh 安装脚本。"
-    sh /tmp/get-acme.sh --nocron email="$EMAIL" >/dev/null 2>&1 \
-      || sh /tmp/get-acme.sh --nocron --force email="$EMAIL" >/dev/null 2>&1 \
-      || { sh /tmp/get-acme.sh --nocron --force email="$EMAIL"; }
+    # 不重定向输出：安装失败时需要看到 acme.sh 自己的报错
+    if [[ "$ACME_NOCRON" == "1" ]]; then
+      sh /tmp/get-acme.sh --nocron email="$EMAIL" || true
+    else
+      sh /tmp/get-acme.sh email="$EMAIL" || true
+    fi
     rm -f /tmp/get-acme.sh
-    [[ -x "$ACME" ]] || die "acme.sh 安装失败，请检查上面的输出。"
+    [[ -x "$ACME" ]] || die "acme.sh 安装失败，原因见上方 acme.sh 的输出。"
   fi
   "$ACME" --set-default-ca --server letsencrypt >/dev/null
 
@@ -371,10 +427,11 @@ if [[ "$CERT_MODE" != "3" ]]; then
     --reloadcmd      "systemctl restart sing-box" >/dev/null
   fix_perms "$CERT_FILE" "$KEY_FILE"
 
-  # 用 systemd timer 代替 cron 驱动续期，每天随机时间跑一次，
-  # 到期前 30 天 acme.sh 会自动续并执行 reloadcmd 重启 sing-box。
-  info "配置证书自动续期 timer…"
-  cat > /etc/systemd/system/acme-renew.service <<EOF
+  if [[ "$ACME_NOCRON" == "1" ]]; then
+    # 无 cron 时用 systemd timer 驱动续期：每日一次，随机延迟打散，
+    # 关机期间错过的任务开机补跑。
+    info "配置证书自动续期 timer…"
+    cat > /etc/systemd/system/acme-renew.service <<EOF
 [Unit]
 Description=Renew ACME certificates (acme.sh)
 After=network-online.target
@@ -384,7 +441,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=$ACME --cron --home $HOME/.acme.sh
 EOF
-  cat > /etc/systemd/system/acme-renew.timer <<'EOF'
+    cat > /etc/systemd/system/acme-renew.timer <<'EOF'
 [Unit]
 Description=Daily ACME certificate renewal
 
@@ -396,10 +453,13 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now acme-renew.timer >/dev/null 2>&1 \
-    || warn "acme-renew.timer 启用失败，请手动检查。"
-  ok "证书就绪（acme-renew.timer 每日检查，到期自动续并重启服务）"
+    systemctl daemon-reload
+    systemctl enable --now acme-renew.timer >/dev/null 2>&1 \
+      || warn "acme-renew.timer 启用失败，请手动检查。"
+    ok "证书就绪（acme-renew.timer 每日检查，到期自动续并重启服务）"
+  else
+    ok "证书就绪（acme.sh crontab 每日检查，到期自动续并重启服务）"
+  fi
 else
   # 用户自带证书，同样要保证服务用户可读
   fix_perms "$CERT_FILE" "$KEY_FILE"
@@ -509,7 +569,7 @@ $(jq -n --arg n "$NODE_NAME" --arg s "$DOMAIN" --arg pw "$PASSWORD" --argjson p 
 
 ── 提示 ────────────────────────────────────────────────
   · 客户端只开 UDP 转发；连接复用(mux)、TCP Fast Open 必须关闭
-  · 证书由 acme-renew.timer 每日检查、自动续期并重启 sing-box
+  · 证书每日自动检查、到期前自动续期并重启 sing-box（anytls cert 可查）
   · 管理命令： anytls {info|qr|log|cert|restart|update|uninstall}
 ════════════════════════════════════════════════════════
 EOF
@@ -526,7 +586,11 @@ case "\${1:-info}" in
   qr)        qrencode -t ANSIUTF8 < $LINK_FILE ;;
   log)       journalctl -u sing-box -n 100 --no-pager -f ;;
   cert)      echo "到期时间: \$(openssl x509 -in $CERT_FILE -noout -enddate | cut -d= -f2)"
-             systemctl list-timers acme-renew.timer --no-pager 2>/dev/null || true ;;
+             if systemctl list-unit-files acme-renew.timer >/dev/null 2>&1; then
+               systemctl list-timers acme-renew.timer --no-pager 2>/dev/null || true
+             else
+               echo "续期方式: acme.sh crontab"; crontab -l 2>/dev/null | grep acme || true
+             fi ;;
   restart)   systemctl restart sing-box && systemctl --no-pager status sing-box ;;
   status)    systemctl --no-pager status sing-box ;;
   update)    apt-get update -qq && apt-get install -y --only-upgrade sing-box && systemctl restart sing-box && sing-box version ;;
