@@ -87,10 +87,28 @@ confirm() { # confirm <提示> <默认y|n>
 }
 
 port_holder() { # 返回占用某端口的进程名，空闲时返回空字符串
-  # 注意：端口空闲时 grep 无匹配会返回 1，配合 pipefail 会误判为致命错误，
-  # 故整条管道以 || true 兜底。
+  # 端口空闲时 grep 无匹配返回 1，配合 pipefail 会被误判为致命错误，故用 || true 兜底
   { ss -lntpH "sport = :$1" 2>/dev/null || true; } \
     | grep -oP 'users:\(\("\K[^"]+' 2>/dev/null | head -n1 || true
+}
+
+# sing-box 1.12 起 systemd unit 改用非 root 的 sing-box 用户运行，
+# 配置与私钥必须让该用户可读，否则服务起不来（status=217/USER 或 permission denied）。
+sb_service_user() {
+  local u
+  u=$(systemctl show -p User --value sing-box 2>/dev/null || true)
+  echo "${u:-root}"
+}
+
+fix_perms() { # fix_perms <文件...>
+  local u g f
+  u=$(sb_service_user)
+  g=$(id -gn "$u" 2>/dev/null || echo "$u")
+  for f in "$@"; do
+    [[ -e "$f" ]] || continue
+    chown "root:$g" "$f" 2>/dev/null || true
+    chmod 640 "$f"
+  done
 }
 
 # ---------------------------------------------------------------- 卸载
@@ -127,7 +145,10 @@ hr
 info "安装基础依赖…"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates openssl socat jq dnsutils iproute2 qrencode >/dev/null
+# cron 是必需的：acme.sh 在没有 crontab 的机器上会拒绝安装（无法自动续期）
+apt-get install -y -qq curl ca-certificates openssl socat jq dnsutils iproute2 qrencode cron >/dev/null
+systemctl enable --now cron >/dev/null 2>&1 || true
+command -v crontab >/dev/null || die "crontab 不可用，acme.sh 无法配置自动续期。"
 ok "依赖就绪"
 
 # 取本机公网 IP
@@ -308,10 +329,12 @@ fi
 if [[ "$CERT_MODE" != "3" ]]; then
   install -d -m 755 "$CERT_DIR"
 
-  if [[ ! -x "$ACME" ]]; then
+  # 上一次安装可能中途失败留下残缺目录，用能否正常执行来判断而非只看文件存在
+  if ! ( [[ -x "$ACME" ]] && "$ACME" --version >/dev/null 2>&1 ); then
     info "安装 acme.sh…"
+    rm -rf "$HOME/.acme.sh"
     curl -fsSL https://get.acme.sh | sh -s email="$EMAIL" >/dev/null
-    [[ -x "$ACME" ]] || die "acme.sh 安装失败。"
+    [[ -x "$ACME" ]] || die "acme.sh 安装失败，请检查上面的输出。"
   fi
   "$ACME" --set-default-ca --server letsencrypt >/dev/null
 
@@ -341,8 +364,11 @@ if [[ "$CERT_MODE" != "3" ]]; then
     --fullchain-file "$CERT_FILE" \
     --key-file       "$KEY_FILE" \
     --reloadcmd      "systemctl restart sing-box" >/dev/null
-  chmod 600 "$KEY_FILE"
+  fix_perms "$CERT_FILE" "$KEY_FILE"
   ok "证书就绪（到期前会自动续期并重启服务）"
+else
+  # 用户自带证书，同样要保证服务用户可读
+  fix_perms "$CERT_FILE" "$KEY_FILE"
 fi
 
 CERT_END=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2 || echo "未知")
@@ -375,7 +401,9 @@ jq -n \
      }],
      outbounds: [{ type: "direct", tag: "direct" }]
    }' > "$CONF_FILE"
-chmod 600 "$CONF_FILE"
+fix_perms "$CONF_FILE"
+chmod 755 "$CONF_DIR"
+[[ -d "$CERT_DIR" ]] && chmod 755 "$CERT_DIR"
 
 sing-box check -c "$CONF_FILE" || die "配置文件校验未通过。"
 ok "配置校验通过"
