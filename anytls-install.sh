@@ -53,7 +53,13 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-trap 'die "脚本在第 $LINENO 行执行失败，上面是最后的输出。"' ERR
+on_err() {
+  # 命令替换在子 shell 中执行，会让 trap 触发两次，这里只保留第一条
+  [[ -n "${_ERR_REPORTED:-}" ]] && exit 1
+  export _ERR_REPORTED=1
+  die "脚本在第 $1 行执行失败，上面是最后的输出。"
+}
+trap 'on_err $LINENO' ERR
 
 # 允许 curl | bash 形式下仍能交互
 [[ -t 0 ]] || { [[ -e /dev/tty ]] && exec < /dev/tty; } || true
@@ -80,8 +86,11 @@ confirm() { # confirm <提示> <默认y|n>
   [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
 
-port_holder() { # 返回占用某端口的进程名
-  ss -lntpH "sport = :$1" 2>/dev/null | grep -oP 'users:\(\("\K[^"]+' | head -n1
+port_holder() { # 返回占用某端口的进程名，空闲时返回空字符串
+  # 注意：端口空闲时 grep 无匹配会返回 1，配合 pipefail 会误判为致命错误，
+  # 故整条管道以 || true 兜底。
+  { ss -lntpH "sport = :$1" 2>/dev/null || true; } \
+    | grep -oP 'users:\(\("\K[^"]+' 2>/dev/null | head -n1 || true
 }
 
 # ---------------------------------------------------------------- 卸载
@@ -140,8 +149,8 @@ while :; do
     warn "域名格式不正确，请重新输入。"; DOMAIN=""; continue
   fi
   # 解析校验
-  RES4=$(dig +short A    "$DOMAIN" @1.1.1.1 2>/dev/null | tail -n1)
-  RES6=$(dig +short AAAA "$DOMAIN" @1.1.1.1 2>/dev/null | tail -n1)
+  RES4=$(dig +short A    "$DOMAIN" @1.1.1.1 2>/dev/null | tail -n1 || true)
+  RES6=$(dig +short AAAA "$DOMAIN" @1.1.1.1 2>/dev/null | tail -n1 || true)
   if [[ -z "$RES4$RES6" ]]; then
     warn "$DOMAIN 没有解析到任何 A/AAAA 记录。"
     confirm "仍要继续？" n || { DOMAIN=""; continue; }
@@ -275,7 +284,7 @@ else
   ok "sing-box 安装完成：$(sing-box version | head -n1)"
 fi
 
-SB_VER=$(sing-box version | head -n1 | grep -oP '\d+\.\d+' | head -n1)
+SB_VER=$(sing-box version 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1 || true)
 if [[ -n "$SB_VER" ]] && awk "BEGIN{exit !($SB_VER < 1.12)}"; then
   die "sing-box 版本过低（$SB_VER），AnyTLS 需要 1.12 及以上。"
 fi
