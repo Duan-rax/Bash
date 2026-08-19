@@ -78,6 +78,31 @@ trap 'on_err $LINENO' ERR
 # 允许 curl | bash 形式下仍能交互
 [[ -t 0 ]] || { [[ -e /dev/tty ]] && exec < /dev/tty; } || true
 
+# ---------------------------------------------------------------- 配置目录探测
+# deb 源装的 sing-box 用 /etc/sing-box，官方 install.sh 手动装的用 /usr/local/etc/sing-box。
+# 直接读 systemd unit 的 ExecStart，避免硬编码写错地方。
+detect_conf_dir() {
+  local line path=""
+  line=$(systemctl cat sing-box 2>/dev/null | grep -m1 '^ExecStart=' || true)
+  [[ -n "$line" ]] || return 0
+  if   [[ "$line" =~ (^|[[:space:]])(-c|--config)[[:space:]]+([^[:space:]]+) ]]; then
+    path=$(dirname "${BASH_REMATCH[3]}")
+  elif [[ "$line" =~ (^|[[:space:]])(-C|--config-directory)[[:space:]]+([^[:space:]]+) ]]; then
+    path=${BASH_REMATCH[3]%/}
+  fi
+  [[ -n "$path" && "$path" != "$CONF_DIR" ]] || return 0
+  warn "systemd unit 指向 $path，脚本改用该目录（默认 $CONF_DIR）。"
+  CONF_DIR="$path"
+  CERT_DIR="$CONF_DIR/cert"
+  CONF_FILE="$CONF_DIR/config.json"
+  STATE_FILE="$CONF_DIR/sbx.conf"
+  INFO_FILE="$CONF_DIR/sbx-info.txt"
+  LINK_FILE="$CONF_DIR/sbx-links.txt"
+  SELF_COPY="$CONF_DIR/sbx-install.sh"
+  return 0
+}
+detect_conf_dir
+
 # ---------------------------------------------------------------- 工具函数
 urlencode() {
   local s=$1 out="" c i
@@ -463,15 +488,16 @@ EOF
 
 # ---------------------------------------------------------------- 管理命令
 write_cli() {
-  cat > /usr/local/bin/sbx <<'CLIEOF'
-#!/usr/bin/env bash
-set -euo pipefail
-CONF_DIR=/etc/sing-box
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'CONF_DIR=%q\n' "$CONF_DIR"
+    cat <<'CLIEOF'
 INFO_FILE="$CONF_DIR/sbx-info.txt"
 LINK_FILE="$CONF_DIR/sbx-links.txt"
-CERT_FILE="$CONF_DIR/cert/cert.pem"
 INSTALLER="$CONF_DIR/sbx-install.sh"
-[[ -f "$CONF_DIR/sbx.conf" ]] && . "$CONF_DIR/sbx.conf"
+CERT_FILE="$CONF_DIR/cert/cert.pem"
+[[ -f "$CONF_DIR/sbx.conf" ]] && . "$CONF_DIR/sbx.conf"   # sbx.conf 里的 CERT_FILE 会覆盖上面的默认值
 
 case "${1:-info}" in
   info)    cat "$INFO_FILE" ;;
@@ -504,6 +530,7 @@ case "${1:-info}" in
   *) echo "用法: sbx {info|link|qr [anytls|hy2]|log|cert|renew|status|restart|update|menu|uninstall}" ;;
 esac
 CLIEOF
+  } > /usr/local/bin/sbx
   chmod +x /usr/local/bin/sbx
   [[ -n "$SELF" && -f "$SELF" ]] && install -m 700 "$SELF" "$SELF_COPY"
   return 0
@@ -838,7 +865,7 @@ else
 fi
 
 SB_VER=$(sing-box version 2>/dev/null | head -n1 | grep -oP '\d+(\.\d+)+' | head -n1 || true)
-if [[ -n "$SB_VER" ]] && ! ver_ge "$SB_VER" "1.12.0"; then
+if [[ -n "$SB_VER" ]] && ! ver_ge "$SB_VER" "1.12"; then
   die "sing-box 版本过低（$SB_VER），AnyTLS 需要 1.12 及以上。"
 fi
 
