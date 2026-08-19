@@ -34,7 +34,11 @@ HY2_CC=${HY2_CC:-}                 # brutal | limit | bbr  流控方式
 HY2_UP=${HY2_UP:-}                 # limit 模式：服务端→客户端 Mbps（你的下载）
 HY2_DOWN=${HY2_DOWN:-}             # limit 模式：客户端→服务端 Mbps（你的上传）
 HY2_OBFS=${HY2_OBFS:-}             # 留空 = 不启用 salamander 混淆
-HY2_MASQ=${HY2_MASQ:-}             # 留空 = 不伪装，形如 https://bing.com
+HY2_MASQ_MODE=${HY2_MASQ_MODE:-}   # file | proxy | none
+HY2_MASQ=${HY2_MASQ:-}             # proxy 模式的目标站，形如 https://bing.com
+HY2_MASQ_DIR=${HY2_MASQ_DIR:-/var/www/hy2-decoy}   # file 模式的静态站目录
+HY2_HOP=${HY2_HOP:-}               # 端口跳跃范围，如 20000-50000，留空 = 不启用
+HY2_HOP_IFACE=${HY2_HOP_IFACE:-}   # 入口网卡，留空 = 自动探测默认路由网卡
 CERT_MODE=${CERT_MODE:-}           # 1=HTTP-01  2=Cloudflare DNS-01  3=已有证书
 CF_Token=${CF_Token:-${CF_TOKEN:-}}   # 两种写法都认
 CERT_FILE=${CERT_FILE:-}
@@ -175,7 +179,11 @@ HY2_CC='$HY2_CC'
 HY2_UP='$HY2_UP'
 HY2_DOWN='$HY2_DOWN'
 HY2_OBFS='$HY2_OBFS'
+HY2_MASQ_MODE='$HY2_MASQ_MODE'
 HY2_MASQ='$HY2_MASQ'
+HY2_MASQ_DIR='$HY2_MASQ_DIR'
+HY2_HOP='$HY2_HOP'
+HY2_HOP_IFACE='$HY2_HOP_IFACE'
 EOF
   chmod 600 "$STATE_FILE"
 }
@@ -192,6 +200,73 @@ net.core.wmem_max = 16777216
 SYSCTLEOF
   sysctl --system >/dev/null 2>&1 || true
   ok "拥塞控制：$(sysctl -n net.ipv4.tcp_congestion_control)　UDP 缓冲：$(sysctl -n net.core.rmem_max)"
+}
+
+# ---------------------------------------------------------------- 端口跳跃
+# sing-box 不像官方 hysteria 那样支持 listen 端口范围，得自己下 nftables DNAT。
+# 用独立的 table 名，配合「先声明再删除」的写法保证重复执行幂等，
+# 不会影响机器上已有的其它 nftables 规则。
+HOP_UNIT="/etc/systemd/system/sbx-porthop.service"
+
+setup_porthop() {
+  if [[ -z "$HY2_HOP" || "$HY2_ENABLE" != "1" ]]; then
+    teardown_porthop
+    return 0
+  fi
+  command -v iptables >/dev/null || {
+    info "安装 iptables…"
+    apt-get install -y -qq iptables >/dev/null 2>&1 || true
+  }
+  command -v iptables >/dev/null || { warn "没有 iptables，跳过端口跳跃。"; HY2_HOP=""; return 0; }
+
+  local ipt ipt6 range args=""
+  ipt=$(command -v iptables); ipt6=$(command -v ip6tables || true)
+  range=${HY2_HOP/-/:}                        # iptables 的端口范围用冒号
+  [[ -n "$HY2_HOP_IFACE" ]] && args="-i $HY2_HOP_IFACE "
+
+  # 不写网卡：PREROUTING 只处理外部进来的包，本机自己发的走 OUTPUT 不受影响，
+  # 所以「不限网卡」对 VPS 没有副作用，还省掉了网卡名变化导致规则失效的隐患。
+  # 需要限定的多网卡机器可以用 HY2_HOP_IFACE 指定。
+  # 先 -D 再 -A（前缀 - 表示失败不致命），避免服务重启后规则重复累积。
+  cat > "$HOP_UNIT" <<UNITEOF
+[Unit]
+Description=Hysteria2 port hopping (iptables REDIRECT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-$ipt -t nat -D PREROUTING ${args}-p udp --dport $range -j REDIRECT --to-ports $HY2_PORT
+ExecStart=$ipt -t nat -A PREROUTING ${args}-p udp --dport $range -j REDIRECT --to-ports $HY2_PORT
+ExecStop=-$ipt -t nat -D PREROUTING ${args}-p udp --dport $range -j REDIRECT --to-ports $HY2_PORT
+UNITEOF
+  if [[ -n "$ipt6" ]]; then
+    cat >> "$HOP_UNIT" <<UNITEOF6
+ExecStart=-$ipt6 -t nat -D PREROUTING ${args}-p udp --dport $range -j REDIRECT --to-ports $HY2_PORT
+ExecStart=-$ipt6 -t nat -A PREROUTING ${args}-p udp --dport $range -j REDIRECT --to-ports $HY2_PORT
+ExecStop=-$ipt6 -t nat -D PREROUTING ${args}-p udp --dport $range -j REDIRECT --to-ports $HY2_PORT
+UNITEOF6
+  fi
+  cat >> "$HOP_UNIT" <<'UNITEOF3'
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF3
+
+  systemctl daemon-reload
+  systemctl enable --now sbx-porthop.service >/dev/null 2>&1 \
+    || { warn "端口跳跃加载失败：journalctl -u sbx-porthop"; return 0; }
+  ok "端口跳跃已生效：UDP $HY2_HOP → $HY2_PORT"
+  return 0
+}
+
+teardown_porthop() {
+  [[ -f "$HOP_UNIT" ]] || return 0
+  systemctl disable --now sbx-porthop.service >/dev/null 2>&1 || true
+  rm -f "$HOP_UNIT" /etc/sing-box/porthop.sh
+  systemctl daemon-reload 2>/dev/null || true
+  return 0
 }
 
 # ---------------------------------------------------------------- 交互子流程
@@ -265,13 +340,68 @@ ask_hy2() {
     ask_bw "你的下载带宽 Mbps（服务端 up）" 200 HY2_UP
     ask_bw "你的上传带宽 Mbps（服务端 down）" 50  HY2_DOWN
   fi
-  if [[ -z "$HY2_OBFS" ]] && confirm "启用 salamander 混淆？（对抗 QUIC 特征识别，客户端需同步配置）" n; then
-    HY2_OBFS=$(genpw); info "混淆密码：${BD}$HY2_OBFS${N}"
+  echo
+  echo "  ${BD}抗封锁方式${N}${D}（混淆与伪装互斥，只能二选一）${N}"
+  echo "  1) HTTP/3 伪装 ${D}默认。协议本身长得像 HTTP/3，被主动探测时返回真实网页${N}"
+  echo "  2) salamander 混淆 ${D}每个包混淆成随机字节。仅当你的网络针对性屏蔽${N}"
+  echo "                     ${D}QUIC/HTTP3、但放行普通 UDP 时才需要。开了就失去伪装能力${N}"
+  echo
+  read -r -p "  选择 [默认 1]: " AC || true
+  if [[ "${AC:-1}" == "2" ]]; then
+    [[ -n "$HY2_OBFS" ]] || HY2_OBFS=$(genpw)
+    HY2_MASQ_MODE='none'
+    info "混淆密码：${BD}$HY2_OBFS${N}"
+    warn "混淆已开启，masquerade 不再生效（标准 QUIC 客户端连握手都完不成），已自动关闭。"
+  else
+    HY2_OBFS=""
   fi
-  if [[ -z "$HY2_MASQ" ]] && confirm "启用 masquerade 伪装（非法请求反代到真站）？" y; then
-    read -r -p "  伪装目标 [默认 https://bing.com]: " HY2_MASQ || true
+  if [[ -z "$HY2_MASQ_MODE" && -z "$HY2_OBFS" ]]; then
+    echo
+    echo "  ${BD}masquerade 伪装${N}${D}（非 Hy2 客户端用 HTTP/3 探测时返回什么）${N}"
+    echo "  1) 不启用     ${D}默认。所有 HTTP 请求返回 404，没有额外维护成本${N}"
+    echo "  2) 本地静态页 ${D}无外部请求、响应快，脚本会生成一个占位站点${N}"
+    echo "  3) 反代真实站 ${D}内容真实，但每次被探测服务器都会真去拉一次，费流量${N}"
+    echo
+    read -r -p "  选择 [默认 1]: " M || true
+    case "${M:-1}" in 2) HY2_MASQ_MODE='file' ;; 3) HY2_MASQ_MODE='proxy' ;; *) HY2_MASQ_MODE='none' ;; esac
+  fi
+  if [[ "$HY2_MASQ_MODE" == "proxy" && -z "$HY2_MASQ" ]]; then
+    read -r -p "  反代目标 [默认 https://bing.com]: " HY2_MASQ || true
     HY2_MASQ=${HY2_MASQ:-https://bing.com}
   fi
+  if [[ -z "$HY2_HOP" ]]; then
+    echo
+    echo "  ${D}端口跳跃：客户端在一段端口范围内随机跳换，绕过运营商对单端口的 UDP 限速。${N}"
+    echo "  ${D}只对「限特定端口」有效；如果 UDP 本身被限，跳了也没用。${N}"
+    if confirm "启用端口跳跃？" n; then
+      read -r -p "  端口范围 [默认 20000-50000]: " HY2_HOP || true
+      HY2_HOP=${HY2_HOP:-20000-50000}
+      [[ "$HY2_HOP" =~ ^[0-9]+-[0-9]+$ ]] || die "范围格式应为 起始-结束，例如 20000-50000。"
+    fi
+  fi
+}
+
+# file 模式下生成一个占位静态站，目录权限要让 sing-box 服务用户读得到
+setup_decoy_site() {
+  [[ "$HY2_MASQ_MODE" == "file" ]] || return 0
+  install -d -m 755 "$HY2_MASQ_DIR"
+  if [[ ! -s "$HY2_MASQ_DIR/index.html" ]]; then
+    cat > "$HY2_MASQ_DIR/index.html" <<'HTMLEOF'
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>It works</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:40rem;margin:6rem auto;padding:0 1.5rem;color:#333;line-height:1.6}h1{font-weight:600;font-size:1.5rem}code{background:#f4f4f5;padding:.15rem .4rem;border-radius:3px}</style>
+</head><body>
+<h1>It works!</h1>
+<p>This is the default page for this server.</p>
+<p>The web server software is running but no content has been added yet.</p>
+</body></html>
+HTMLEOF
+    chmod 644 "$HY2_MASQ_DIR/index.html"
+    info "已生成占位静态站：$HY2_MASQ_DIR/index.html（建议换成更像真站的内容）"
+  fi
+  return 0
 }
 
 fw_allow() {   # fw_allow <端口> <tcp|udp>
@@ -287,6 +417,7 @@ fw_allow() {   # fw_allow <端口> <tcp|udp>
 # ---------------------------------------------------------------- 生成配置
 build_config() {
   local inb='[]'
+  [[ "$HY2_ENABLE" == "1" ]] && setup_decoy_site
 
   if [[ "$ANYTLS_ENABLE" == "1" ]]; then
     inb=$(jq -n --argjson cur "$inb" \
@@ -308,7 +439,8 @@ build_config() {
       --arg pw "$HY2_PASSWORD" --arg sni "$DOMAIN" \
       --arg cert "$CERT_FILE" --arg key "$KEY_FILE" --argjson port "$HY2_PORT" \
       --arg obfs "$HY2_OBFS" --arg masq "$HY2_MASQ" \
-      --arg cc "$HY2_CC" --arg up "${HY2_UP:-0}" --arg down "${HY2_DOWN:-0}" '
+      --arg cc "$HY2_CC" --arg up "${HY2_UP:-0}" --arg down "${HY2_DOWN:-0}" \
+      --arg mmode "$HY2_MASQ_MODE" --arg mdir "$HY2_MASQ_DIR" '
       $cur + [
         ({
           type: "hysteria2",
@@ -326,18 +458,28 @@ build_config() {
            elif $cc == "limit" then { up_mbps: ($up|tonumber), down_mbps: ($down|tonumber) }
            else {} end)
         + (if $obfs != "" then { obfs: { type: "salamander", password: $obfs } } else {} end)
-        + (if $masq != "" then { masquerade: $masq } else {} end)
+        # 字符串简写等价于 rewrite_host=false，转发时 Host 头仍是本机域名，
+        # 目标站会返回 404 / 跳转，伪装打折。这里一律用对象形式写全。
+        + (if $mmode == "file" then
+             { masquerade: { type: "file", directory: $mdir } }
+           elif $mmode == "proxy" and $masq != "" then
+             { masquerade: { type: "proxy", proxy: { url: $masq, rewrite_host: true } } }
+           else {} end)
       ]')
   fi
 
   [[ "$(jq 'length' <<<"$inb")" != "0" ]] || die "没有启用任何协议，拒绝写出空配置。"
 
   local tmp; tmp=$(mktemp)
-  jq -n --argjson inb "$inb" '{
+  # 内联 sniff 字段在 1.11 弃用、1.13 移除，必须写成路由规则的 action
+  jq -n --argjson inb "$inb" --argjson sniff "${ENABLE_SNIFF:-1}" '{
     log: { level: "info", timestamp: true },
     inbounds: $inb,
     outbounds: [{ type: "direct", tag: "direct" }]
-  }' > "$tmp"
+  }
+  + (if $sniff == 1 then
+       { route: { rules: [ { action: "sniff", timeout: "1s" } ] } }
+     else {} end)' > "$tmp"
 
   if ! sing-box check -c "$tmp" 2>&1; then
     rm -f "$tmp"
@@ -423,7 +565,12 @@ EOF
       obfs_q="&obfs=salamander&obfs-password=$(urlencode "$HY2_OBFS")"
       obfs_yaml=$'\n      obfs: salamander\n      obfs-password: "'"$HY2_OBFS"'"'
     fi
-    link="hysteria2://$(urlencode "$HY2_PASSWORD")@${DOMAIN}:${HY2_PORT}/?sni=${DOMAIN}&alpn=h3&insecure=0${obfs_q}#$(urlencode "$name")"
+    local hop_q="" hop_yaml=""
+    if [[ -n "$HY2_HOP" ]]; then
+      hop_q="&mport=${HY2_HOP}"
+      hop_yaml=$'\n      ports: "'"$HY2_HOP"$'"\n      hop-interval: 30'
+    fi
+    link="hysteria2://$(urlencode "$HY2_PASSWORD")@${DOMAIN}:${HY2_PORT}/?sni=${DOMAIN}&alpn=h3&insecure=0${obfs_q}${hop_q}#$(urlencode "$name")"
     echo "hy2|$link" >> "$LINK_FILE"
     local cc_desc yaml_bw="" bw_tip=""
     case "$HY2_CC" in
@@ -445,8 +592,10 @@ EOF
   端口(UDP) : $HY2_PORT
   密码      : $HY2_PASSWORD
   流控      : $cc_desc
-  混淆      : ${HY2_OBFS:-未启用}
-  伪装站点  : ${HY2_MASQ:-未启用}
+  混淆      : ${HY2_OBFS:+salamander（已开，伪装失效）}${HY2_OBFS:-未启用}
+  端口跳跃  : ${HY2_HOP:+UDP $HY2_HOP → $HY2_PORT}${HY2_HOP:-未启用}
+  伪装方式  : $([[ "$HY2_MASQ_MODE" == "file" ]] && echo "本地静态页 $HY2_MASQ_DIR" \
+                || { [[ "$HY2_MASQ_MODE" == "proxy" ]] && echo "反代 $HY2_MASQ (rewrite_host)" || echo "未启用"; })
 
   $link
 
@@ -459,7 +608,7 @@ EOF
       sni: $DOMAIN
       alpn:
         - h3
-      skip-cert-verify: false$obfs_yaml$yaml_bw
+      skip-cert-verify: false$obfs_yaml$yaml_bw$hop_yaml
 
   带宽说明:
 $bw_tip
@@ -477,6 +626,8 @@ EOF
 ── 提示 ────────────────────────────────────────────────
   · AnyTLS 客户端：连接复用(mux)、TCP Fast Open 必须关闭
   · Hysteria2 走 UDP，云厂商安全组别忘了放行对应 UDP 端口
+  · 开了端口跳跃的话，安全组要放行整个 UDP 范围，不只是监听端口
+  · 混淆(salamander)与 HTTP/3 伪装互斥：开了混淆，masquerade 永远不会被触发
   · 服务端已设 ignore_client_bandwidth，统一使用 BBR，
     客户端填不填带宽都不会启用 Brutal
   · 证书每日自动检查、到期自动续期并重启 sing-box
@@ -518,6 +669,13 @@ case "${1:-info}" in
     crontab -l 2>/dev/null | grep acme || true ;;
   renew)   "$HOME/.acme.sh/acme.sh" --renew -d "$DOMAIN" --ecc --force ;;
   status)  systemctl --no-pager status sing-box ;;
+  hop)
+    if systemctl list-unit-files sbx-porthop.service >/dev/null 2>&1; then
+      systemctl is-active --quiet sbx-porthop && echo "服务: 已启用" || echo "服务: 未运行"
+      iptables -t nat -S PREROUTING | grep -- REDIRECT || echo "(无规则)"
+    else
+      echo "未启用端口跳跃"
+    fi ;;
   restart) systemctl restart sing-box && systemctl --no-pager status sing-box ;;
   update)  apt-get update -qq && apt-get install -y --only-upgrade sing-box \
              && systemctl restart sing-box && sing-box version ;;
@@ -527,7 +685,7 @@ case "${1:-info}" in
   uninstall)
     [[ -x "$INSTALLER" ]] && exec bash "$INSTALLER" uninstall
     echo "找不到安装脚本，请手动卸载。"; exit 1 ;;
-  *) echo "用法: sbx {info|link|qr [anytls|hy2]|log|cert|renew|status|restart|update|menu|uninstall}" ;;
+  *) echo "用法: sbx {info|link|qr [anytls|hy2]|log|cert|renew|status|hop|restart|update|menu|uninstall}" ;;
 esac
 CLIEOF
   } > /usr/local/bin/sbx
@@ -566,7 +724,13 @@ migrate_legacy() {
     HY2_PORT=$(jq -r '.listen_port' <<<"$h")
     HY2_PASSWORD=$(jq -r '.users[0].password' <<<"$h")
     HY2_OBFS=$(jq -r '.obfs.password // empty' <<<"$h")
-    HY2_MASQ=$(jq -r 'if (.masquerade|type)=="string" then .masquerade else "" end' <<<"$h")
+    case "$(jq -r '.masquerade | if type=="string" then "proxy" elif type=="object" then .type else "none" end' <<<"$h")" in
+      proxy) HY2_MASQ_MODE='proxy'
+             HY2_MASQ=$(jq -r 'if (.masquerade|type)=="string" then .masquerade else (.masquerade.proxy.url // "") end' <<<"$h") ;;
+      file)  HY2_MASQ_MODE='file'
+             HY2_MASQ_DIR=$(jq -r '.masquerade.directory' <<<"$h") ;;
+      *)     HY2_MASQ_MODE='none' ;;
+    esac
     if [[ "$(jq -r '.ignore_client_bandwidth // false' <<<"$h")" == "true" ]]; then HY2_CC=bbr
     elif [[ "$(jq -r '.up_mbps // 0' <<<"$h")" != "0" ]]; then
       HY2_CC=limit; HY2_UP=$(jq -r '.up_mbps' <<<"$h"); HY2_DOWN=$(jq -r '.down_mbps // 0' <<<"$h")
@@ -574,7 +738,11 @@ migrate_legacy() {
     [[ -z "$DOMAIN" ]] && DOMAIN=$(jq -r '.tls.server_name // empty' <<<"$h")
     [[ -z "$CERT_FILE" ]] && { CERT_FILE=$(jq -r '.tls.certificate_path // empty' <<<"$h")
                                KEY_FILE=$(jq -r '.tls.key_path // empty' <<<"$h"); }
-    ok "读到 Hysteria2：UDP $HY2_PORT"
+    if [[ -f "$HOP_UNIT" ]]; then
+      HY2_HOP=$(grep -oP -- '--dport \K[0-9]+:[0-9]+' "$HOP_UNIT" 2>/dev/null | head -n1 || true)
+      HY2_HOP=${HY2_HOP/:/-}
+    fi
+    ok "读到 Hysteria2：UDP $HY2_PORT${HY2_HOP:+，端口跳跃 $HY2_HOP}"
   fi
 
   [[ -n "$DOMAIN" && -s "$CERT_FILE" && -s "$KEY_FILE" ]] \
@@ -597,6 +765,7 @@ do_uninstall() {
   echo
   warn "即将卸载 sing-box 与相关配置。"
   confirm "确认继续？" n || { echo "已取消。"; exit 0; }
+  teardown_porthop
   systemctl disable --now sing-box 2>/dev/null || true
   systemctl disable --now acme-renew.timer 2>/dev/null || true
   rm -f /etc/systemd/system/acme-renew.service /etc/systemd/system/acme-renew.timer
@@ -665,7 +834,7 @@ if [[ -f "$STATE_FILE" && "$NONINTERACTIVE" != "1" ]]; then
          fi
        fi
        [[ "$ANYTLS_ENABLE$HY2_ENABLE" == "00" ]] && die "不能同时停用两个协议，请直接卸载。"
-       build_config; save_state; build_info; restart_sb
+       build_config; setup_porthop; save_state; build_info; restart_sb
        [[ "$HY2_ENABLE" == "1" ]] && { echo; cat "$INFO_FILE"; }
        ok "Hysteria2 现在 $([[ $HY2_ENABLE == 1 ]] && echo 启用 || echo 停用)"
        exit 0 ;;
@@ -845,6 +1014,7 @@ printf "  %-12s %s\n" "邮箱" "$EMAIL"
 [[ "$HY2_ENABLE" == "1" ]]    && printf "  %-12s %s\n" "流控" "$([[ $HY2_CC == brutal ]] && echo 'Brutal（客户端声明）' || { [[ $HY2_CC == limit ]] && echo "Brutal 封顶 ${HY2_UP}/${HY2_DOWN} Mbps" || echo '强制 BBR'; })"
 printf "  %-12s %s\n" "证书" "$([[ $CERT_MODE == 1 ]] && echo HTTP-01 || { [[ $CERT_MODE == 2 ]] && echo 'DNS-01 (Cloudflare)' || echo '已有证书'; })"
 printf "  %-12s %s\n" "内核调优" "$([[ $ENABLE_TUNE == 1 ]] && echo 开启 || echo 跳过)"
+printf "  %-12s %s\n" "协议嗅探" "$([[ ${ENABLE_SNIFF:-1} == 1 ]] && echo 开启 || echo 关闭)"
 echo
 confirm "开始安装？" y || { echo "已取消。"; exit 0; }
 
@@ -972,6 +1142,7 @@ fi
 # ---------------------------------------------------------------- 写配置并启动
 info "生成 $CONF_FILE …"
 build_config
+setup_porthop
 save_state
 build_info
 write_cli
