@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# AnyTLS (sing-box) 交互式安装脚本  ——  Debian 11/12/13
+# AnyTLS (sing-box) 交互式安装脚本 —— Debian 11/12/13
 #
-#   bash anytls-install.sh              交互安装
-#   bash anytls-install.sh uninstall    卸载
+#   bash anytls-install.sh            交互安装
+#   bash anytls-install.sh uninstall  卸载
 #
 # 支持环境变量预设实现非交互安装，例如：
 #   DOMAIN=a.example.com EMAIL=me@x.com PORT=443 CERT_MODE=1 \
@@ -24,14 +24,15 @@ EMAIL=${EMAIL:-}
 PORT=${PORT:-}
 PASSWORD=${PASSWORD:-}
 NODE_NAME=${NODE_NAME:-}
-CERT_MODE=${CERT_MODE:-}          # 1=HTTP-01  2=Cloudflare DNS-01  3=已有证书
-CF_TOKEN=${CF_Token:-}
+CERT_MODE=${CERT_MODE:-}              # 1=HTTP-01  2=Cloudflare DNS-01  3=已有证书
+CF_Token=${CF_Token:-${CF_TOKEN:-}}   # acme.sh 用的是 CF_Token，这里两种写法都认
 CERT_FILE=${CERT_FILE:-}
 KEY_FILE=${KEY_FILE:-}
 ENABLE_BBR=${ENABLE_BBR:-}
 NONINTERACTIVE=${NONINTERACTIVE:-0}
 
 STOPPED_SVC=""
+ACME_NOCRON=0
 
 # ---------------------------------------------------------------- 输出
 if [[ -t 1 ]]; then
@@ -53,16 +54,40 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+# FIX: 原来用 export _ERR_REPORTED 去重，但 export 在子 shell 里不会回传父进程，
+#      去重实际不生效。改成比较 BASHPID 与 $$，只在主 shell 里报错。
 on_err() {
-  # 命令替换在子 shell 中执行，会让 trap 触发两次，这里只保留第一条
-  [[ -n "${_ERR_REPORTED:-}" ]] && exit 1
-  export _ERR_REPORTED=1
+  [[ "$BASHPID" == "$$" ]] || exit 1
   die "脚本在第 $1 行执行失败，上面是最后的输出。"
 }
 trap 'on_err $LINENO' ERR
 
 # 允许 curl | bash 形式下仍能交互
 [[ -t 0 ]] || { [[ -e /dev/tty ]] && exec < /dev/tty; } || true
+
+# ---------------------------------------------------------------- 配置目录探测
+# FIX: deb 源装的 sing-box 用 /etc/sing-box，官方 install.sh 手动装的用
+#      /usr/local/etc/sing-box。直接读 systemd unit 的 ExecStart，别硬编码。
+detect_conf_dir() {
+  local line path=""
+  line=$(systemctl cat sing-box 2>/dev/null | grep -m1 '^ExecStart=' || true)
+  [[ -n "$line" ]] || return 0
+  if   [[ "$line" =~ (^|[[:space:]])(-c|--config)[[:space:]]+([^[:space:]]+) ]]; then
+    path=$(dirname "${BASH_REMATCH[3]}")
+  elif [[ "$line" =~ (^|[[:space:]])(-C|--config-directory)[[:space:]]+([^[:space:]]+) ]]; then
+    path=${BASH_REMATCH[3]%/}
+  fi
+  [[ -n "$path" && "$path" != "$CONF_DIR" ]] || return 0
+  warn "systemd unit 指向 $path，脚本改用该目录（默认 $CONF_DIR）。"
+  CONF_DIR="$path"
+  CERT_DIR="$CONF_DIR/cert"
+  CONF_FILE="$CONF_DIR/config.json"
+  INFO_FILE="$CONF_DIR/anytls-info.txt"
+  LINK_FILE="$CONF_DIR/anytls-link.txt"
+  return 0
+}
+detect_conf_dir
 
 # ---------------------------------------------------------------- 工具函数
 urlencode() {
@@ -77,16 +102,20 @@ urlencode() {
   printf '%s' "$out"
 }
 
-confirm() { # confirm <提示> <默认y|n>
+confirm() {   # confirm <提示> <默认y|n>
   local prompt=$1 def=${2:-y} ans
   [[ "$NONINTERACTIVE" == "1" ]] && { [[ "$def" == "y" ]]; return; }
   local hint="[Y/n]"; [[ "$def" == "n" ]] && hint="[y/N]"
-  read -r -p "    $prompt $hint " ans || true
+  read -r -p "  $prompt $hint " ans || true
   ans=${ans:-$def}
   [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
 
-port_holder() { # 返回占用某端口的进程名，空闲时返回空字符串
+# FIX: 原来 awk "BEGIN{exit !($SB_VER < 1.12)}" 是浮点比较，1.9 > 1.12 会误判，
+#      导致 1.9/1.10/1.11 通过版本检查、到 sing-box check 才炸。改用 sort -V。
+ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]; }
+
+port_holder() {   # 返回占用某 TCP 端口的进程名，空闲时返回空字符串
   # 端口空闲时 grep 无匹配返回 1，配合 pipefail 会被误判为致命错误，故用 || true 兜底
   { ss -lntpH "sport = :$1" 2>/dev/null || true; } \
     | grep -oP 'users:\(\("\K[^"]+' 2>/dev/null | head -n1 || true
@@ -100,7 +129,7 @@ sb_service_user() {
   echo "${u:-root}"
 }
 
-fix_perms() { # fix_perms <文件...>
+fix_perms() {   # fix_perms <文件...>
   local u g f
   u=$(sb_service_user)
   g=$(id -gn "$u" 2>/dev/null || echo "$u")
@@ -142,10 +171,9 @@ command -v systemctl >/dev/null || die "系统没有 systemd，脚本不支持�
 clear
 echo
 echo "${BD}  AnyTLS · sing-box 安装脚本${N}"
-echo "${D}  Debian / 真实证书 / 自动续期${N}"
+echo "${D}  Debian ／ 真实证书 ／ 自动续期${N}"
 hr
 
-hr
 info "检查并安装依赖…"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq || die "apt-get update 失败，请检查网络或软件源。"
@@ -163,7 +191,7 @@ DEPS=(
   "cron:crontab"          # acme.sh 自动续期需要 crontab
 )
 
-dep_ok() { # dep_ok <包名> <命令>
+dep_ok() {   # dep_ok <包名> <命令>
   if [[ -z "$2" ]]; then dpkg -s "$1" >/dev/null 2>&1; else command -v "$2" >/dev/null 2>&1; fi
 }
 
@@ -171,7 +199,6 @@ MISSING=()
 for item in "${DEPS[@]}"; do
   dep_ok "${item%%:*}" "${item#*:}" || MISSING+=("${item%%:*}")
 done
-
 if (( ${#MISSING[@]} > 0 )); then
   info "缺失组件：${MISSING[*]}，开始安装…"
   # 故意不静默：装不上时需要看到 apt 的真实报错
@@ -180,7 +207,6 @@ fi
 
 # 复核：区分「致命缺失」与「可降级缺失」
 FATAL=()
-ACME_NOCRON=0
 for item in "${DEPS[@]}"; do
   pkg=${item%%:*}; cmd=${item#*:}
   dep_ok "$pkg" "$cmd" && continue
@@ -217,11 +243,14 @@ echo
 # ---------------------------------------------------------------- 域名
 while :; do
   if [[ -z "$DOMAIN" ]]; then
-    read -r -p "    域名（已解析到本机，Cloudflare 需灰云）: " DOMAIN || true
+    read -r -p "  域名（已解析到本机，Cloudflare 需灰云）: " DOMAIN || true
   fi
   DOMAIN=${DOMAIN// /}
   if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?)+$ ]]; then
-    warn "域名格式不正确，请重新输入。"; DOMAIN=""; continue
+    warn "域名格式不正确，请重新输入。"; DOMAIN=""
+    # FIX: 非交互模式下 read 拿不到输入会死循环，这里直接退出
+    [[ "$NONINTERACTIVE" == "1" ]] && die "DOMAIN 非法。"
+    continue
   fi
   # 解析校验
   RES4=$(dig +short A    "$DOMAIN" @1.1.1.1 2>/dev/null | tail -n1 || true)
@@ -242,7 +271,7 @@ done
 # ---------------------------------------------------------------- 邮箱
 while :; do
   if [[ -z "$EMAIL" ]]; then
-    read -r -p "    邮箱（证书到期提醒，回车随机生成）: " EMAIL || true
+    read -r -p "  邮箱（证书到期提醒，回车随机生成）: " EMAIL || true
   fi
   if [[ -z "$EMAIL" ]]; then
     EMAIL="$(openssl rand -hex 6)@${DOMAIN#*.}"
@@ -251,21 +280,24 @@ while :; do
   fi
   [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && break
   warn "邮箱格式不正确。"; EMAIL=""
+  [[ "$NONINTERACTIVE" == "1" ]] && die "EMAIL 非法。"
 done
 
 # ---------------------------------------------------------------- 端口
 while :; do
   if [[ -z "$PORT" ]]; then
-    read -r -p "    监听端口 [默认 443]: " PORT || true
+    read -r -p "  监听端口 [默认 443]: " PORT || true
     PORT=${PORT:-443}
   fi
   if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-    warn "端口须为 1-65535。"; PORT=""; continue
+    warn "端口须为 1-65535。"; PORT=""
+    [[ "$NONINTERACTIVE" == "1" ]] && die "PORT 非法。"
+    continue
   fi
   HOLDER=$(port_holder "$PORT")
   if [[ -n "$HOLDER" && "$HOLDER" != "sing-box" ]]; then
     warn "端口 $PORT 已被 ${BD}$HOLDER${N} 占用。"
-    echo "    ${D}若要与它共存，可让 nginx stream 按 SNI 分流，把 AnyTLS 放到内网端口。${N}"
+    echo "  ${D}若要与它共存，可让 nginx stream 按 SNI 分流，把 AnyTLS 放到内网端口。${N}"
     confirm "换一个端口？" y && { PORT=""; continue; }
   fi
   break
@@ -273,7 +305,7 @@ done
 
 # ---------------------------------------------------------------- 密码
 if [[ -z "$PASSWORD" ]]; then
-  read -r -p "    密码（回车自动生成）: " PASSWORD || true
+  read -r -p "  密码（回车自动生成）: " PASSWORD || true
 fi
 if [[ -z "$PASSWORD" ]]; then
   # 生成 URL 安全字符集，避免分享链接被特殊字符截断
@@ -283,7 +315,7 @@ fi
 
 # ---------------------------------------------------------------- 节点名
 if [[ -z "$NODE_NAME" ]]; then
-  read -r -p "    节点名称 [默认 $DOMAIN]: " NODE_NAME || true
+  read -r -p "  节点名称 [默认 $DOMAIN]: " NODE_NAME || true
   NODE_NAME=${NODE_NAME:-$DOMAIN}
 fi
 
@@ -291,28 +323,29 @@ fi
 hr
 echo "${BD}  第 2 步 · 证书方式${N}"
 echo
-echo "    1) HTTP-01  —— acme.sh standalone，需要 80 端口临时可用（推荐）"
-echo "    2) DNS-01   —— Cloudflare API Token，80 被封或被占时用这个"
-echo "    3) 已有证书 —— 手动指定 fullchain / key 路径"
+echo "  1) HTTP-01  —— acme.sh standalone，需要 80 端口临时可用（推荐）"
+echo "  2) DNS-01   —— Cloudflare API Token，80 被封或被占时用这个"
+echo "  3) 已有证书 —— 手动指定 fullchain / key 路径"
 echo
 while :; do
   if [[ -z "$CERT_MODE" ]]; then
-    read -r -p "    选择 [默认 1]: " CERT_MODE || true
+    read -r -p "  选择 [默认 1]: " CERT_MODE || true
     CERT_MODE=${CERT_MODE:-1}
   fi
   [[ "$CERT_MODE" =~ ^[123]$ ]] && break
   warn "请输入 1、2 或 3。"; CERT_MODE=""
+  [[ "$NONINTERACTIVE" == "1" ]] && die "CERT_MODE 非法。"
 done
 
-if [[ "$CERT_MODE" == "2" && -z "$CF_TOKEN" ]]; then
-  read -r -s -p "    Cloudflare API Token（Zone:DNS:Edit 权限）: " CF_TOKEN || true
+if [[ "$CERT_MODE" == "2" && -z "$CF_Token" ]]; then
+  read -r -s -p "  Cloudflare API Token（Zone:Read + DNS:Edit）: " CF_Token || true
   echo
-  [[ -n "$CF_TOKEN" ]] || die "未提供 Token。"
+  [[ -n "$CF_Token" ]] || die "未提供 Token。"
 fi
 
 if [[ "$CERT_MODE" == "3" ]]; then
-  [[ -n "$CERT_FILE" ]] || read -r -p "    证书 fullchain 路径: " CERT_FILE || true
-  [[ -n "$KEY_FILE"  ]] || read -r -p "    私钥 key 路径: " KEY_FILE || true
+  [[ -n "$CERT_FILE" ]] || read -r -p "  证书 fullchain 路径: " CERT_FILE || true
+  [[ -n "$KEY_FILE"  ]] || read -r -p "  私钥 key 路径: " KEY_FILE || true
   [[ -s "$CERT_FILE" ]] || die "证书文件不存在或为空：$CERT_FILE"
   [[ -s "$KEY_FILE"  ]] || die "私钥文件不存在或为空：$KEY_FILE"
 else
@@ -333,13 +366,13 @@ fi
 hr
 echo "${BD}  确认配置${N}"
 echo
-printf "    %-12s %s\n" "域名"     "$DOMAIN"
-printf "    %-12s %s\n" "邮箱"     "$EMAIL"
-printf "    %-12s %s\n" "端口"     "$PORT"
-printf "    %-12s %s\n" "密码"     "$PASSWORD"
-printf "    %-12s %s\n" "节点名"   "$NODE_NAME"
-printf "    %-12s %s\n" "证书"     "$([[ $CERT_MODE == 1 ]] && echo HTTP-01 || { [[ $CERT_MODE == 2 ]] && echo 'DNS-01 (Cloudflare)' || echo '已有证书'; })"
-printf "    %-12s %s\n" "BBR"      "$([[ $ENABLE_BBR == 1 ]] && echo 开启 || echo 跳过)"
+printf "  %-12s %s\n" "域名"   "$DOMAIN"
+printf "  %-12s %s\n" "邮箱"   "$EMAIL"
+printf "  %-12s %s\n" "端口"   "$PORT"
+printf "  %-12s %s\n" "密码"   "$PASSWORD"
+printf "  %-12s %s\n" "节点名" "$NODE_NAME"
+printf "  %-12s %s\n" "证书"   "$([[ $CERT_MODE == 1 ]] && echo HTTP-01 || { [[ $CERT_MODE == 2 ]] && echo 'DNS-01 (Cloudflare)' || echo '已有证书'; })"
+printf "  %-12s %s\n" "BBR"    "$([[ $ENABLE_BBR == 1 ]] && echo 开启 || echo 跳过)"
 echo
 confirm "开始安装？" y || { echo "已取消。"; exit 0; }
 
@@ -357,10 +390,13 @@ else
   apt-get update -qq
   apt-get install -y -qq sing-box
   ok "sing-box 安装完成：$(sing-box version | head -n1)"
+  # 装完才有 unit，重新探测一次配置目录
+  detect_conf_dir
+  [[ "$CERT_MODE" != "3" ]] && { CERT_FILE="$CERT_DIR/cert.pem"; KEY_FILE="$CERT_DIR/private.key"; }
 fi
 
-SB_VER=$(sing-box version 2>/dev/null | head -n1 | grep -oP '\d+\.\d+' | head -n1 || true)
-if [[ -n "$SB_VER" ]] && awk "BEGIN{exit !($SB_VER < 1.12)}"; then
+SB_VER=$(sing-box version 2>/dev/null | head -n1 | grep -oP '\d+(\.\d+)+' | head -n1 || true)
+if [[ -n "$SB_VER" ]] && ! ver_ge "$SB_VER" "1.12"; then
   die "sing-box 版本过低（$SB_VER），AnyTLS 需要 1.12 及以上。"
 fi
 
@@ -368,11 +404,11 @@ fi
 info "放行端口…"
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
   ufw allow "$PORT"/tcp >/dev/null 2>&1 || true
-  [[ "$CERT_MODE" == "1" ]] && ufw allow 80/tcp >/dev/null 2>&1 || true
+  [[ "$CERT_MODE" == "1" ]] && ufw allow 80/tcp >/dev/null 2>&1
   ok "已写入 ufw 规则"
 elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
   firewall-cmd --permanent --add-port="$PORT"/tcp >/dev/null 2>&1 || true
-  [[ "$CERT_MODE" == "1" ]] && firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1 || true
+  [[ "$CERT_MODE" == "1" ]] && firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1
   firewall-cmd --reload >/dev/null 2>&1 || true
   ok "已写入 firewalld 规则"
 else
@@ -397,9 +433,18 @@ if [[ "$CERT_MODE" != "3" ]]; then
     rm -f /tmp/get-acme.sh
     [[ -x "$ACME" ]] || die "acme.sh 安装失败，原因见上方 acme.sh 的输出。"
   fi
+
   "$ACME" --set-default-ca --server letsencrypt >/dev/null
 
-  if [[ "$CERT_MODE" == "1" ]]; then
+  # FIX: 重跑脚本时原来会无条件 --issue，acme.sh 对已签发域名返回 exit 2
+  #      （"Skipping. Next renewal time is..."）被 || die 拦下直接退出；
+  #      反复签发还会撞 Let's Encrypt 每周 5 次的速率限制。
+  #      这里先看现有证书是否还有 30 天以上有效期，够用就跳过签发。
+  if [[ -s "$CERT_FILE" ]] \
+     && openssl x509 -in "$CERT_FILE" -noout -checkend 2592000 >/dev/null 2>&1 \
+     && openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep -qF "$DOMAIN"; then
+    ok "检测到 $DOMAIN 的有效证书，跳过签发，仅刷新续期钩子。"
+  elif [[ "$CERT_MODE" == "1" ]]; then
     HOLDER80=$(port_holder 80)
     if [[ -n "$HOLDER80" ]]; then
       for svc in nginx caddy apache2 haproxy lighttpd; do
@@ -416,16 +461,18 @@ if [[ "$CERT_MODE" != "3" ]]; then
     cleanup
   else
     info "申请证书（Cloudflare DNS-01）…"
-    CF_Token="$CF_TOKEN" "$ACME" --issue -d "$DOMAIN" --dns dns_cf -k ec-256 \
+    CF_Token="$CF_Token" "$ACME" --issue -d "$DOMAIN" --dns dns_cf -k ec-256 \
       || die "证书申请失败。检查 API Token 权限（Zone:Read + DNS:Edit）。"
   fi
 
   info "安装证书并挂上自动续期钩子…"
   "$ACME" --install-cert -d "$DOMAIN" --ecc \
     --fullchain-file "$CERT_FILE" \
-    --key-file       "$KEY_FILE" \
-    --reloadcmd      "systemctl restart sing-box" >/dev/null
+    --key-file "$KEY_FILE" \
+    --reloadcmd "systemctl restart sing-box" >/dev/null 2>&1 \
+    || warn "install-cert 未成功（证书可能不是 acme.sh 签发的），沿用现有证书文件。"
   fix_perms "$CERT_FILE" "$KEY_FILE"
+  [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] || die "证书或私钥为空：$CERT_FILE / $KEY_FILE"
 
   if [[ "$ACME_NOCRON" == "1" ]]; then
     # 无 cron 时用 systemd timer 驱动续期：每日一次，随机延迟打散，
@@ -470,8 +517,10 @@ CERT_END=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -
 # ---------------------------------------------------------------- 写配置
 info "生成 $CONF_FILE …"
 install -d -m 755 "$CONF_DIR"
-[[ -f "$CONF_FILE" ]] && cp -a "$CONF_FILE" "$CONF_FILE.bak.$(date +%s)"
 
+# FIX: 原来先覆盖 config.json 再 check，校验失败时旧配置已经没了。
+#      改成先写临时文件、校验通过再落盘。
+TMP_CONF=$(mktemp)
 jq -n \
   --arg pw   "$PASSWORD" \
   --arg sni  "$DOMAIN" \
@@ -479,27 +528,31 @@ jq -n \
   --arg key  "$KEY_FILE" \
   --argjson port "$PORT" \
   '{
-     log: { level: "info", timestamp: true },
-     inbounds: [{
-       type: "anytls",
-       tag: "anytls-in",
-       listen: "::",
-       listen_port: $port,
-       users: [{ name: "user", password: $pw }],
-       tls: {
-         enabled: true,
-         server_name: $sni,
-         certificate_path: $cert,
-         key_path: $key
-       }
-     }],
-     outbounds: [{ type: "direct", tag: "direct" }]
-   }' > "$CONF_FILE"
+    log: { level: "info", timestamp: true },
+    inbounds: [{
+      type: "anytls",
+      tag: "anytls-in",
+      listen: "::",
+      listen_port: $port,
+      users: [{ name: "user", password: $pw }],
+      tls: {
+        enabled: true,
+        server_name: $sni,
+        certificate_path: $cert,
+        key_path: $key
+      }
+    }],
+    outbounds: [{ type: "direct", tag: "direct" }]
+  }' > "$TMP_CONF"
+
+sing-box check -c "$TMP_CONF" || { rm -f "$TMP_CONF"; die "配置文件校验未通过，原配置未改动。"; }
+[[ -f "$CONF_FILE" ]] && cp -a "$CONF_FILE" "$CONF_FILE.bak.$(date +%s)"
+cat "$TMP_CONF" > "$CONF_FILE"
+rm -f "$TMP_CONF"
+
 fix_perms "$CONF_FILE"
 chmod 755 "$CONF_DIR"
 [[ -d "$CERT_DIR" ]] && chmod 755 "$CERT_DIR"
-
-sing-box check -c "$CONF_FILE" || die "配置文件校验未通过。"
 ok "配置校验通过"
 
 # ---------------------------------------------------------------- BBR
@@ -536,13 +589,13 @@ cat > "$INFO_FILE" <<EOF
 ════════════════════════════════════════════════════════
   AnyTLS 节点信息
 ════════════════════════════════════════════════════════
-  地址        : $DOMAIN
-  端口        : $PORT
-  密码        : $PASSWORD
-  SNI         : $DOMAIN
-  协议        : anytls
-  证书到期    : $CERT_END
-  安装时间    : $(date '+%F %T %Z')
+  地址      : $DOMAIN
+  端口      : $PORT
+  密码      : $PASSWORD
+  SNI       : $DOMAIN
+  协议      : anytls
+  证书到期  : $CERT_END
+  安装时间  : $(date '+%F %T %Z')
 
 ── 分享链接 ────────────────────────────────────────────
 $LINK
@@ -564,46 +617,57 @@ proxies:
 
 ── sing-box 客户端 outbound ────────────────────────────
 $(jq -n --arg n "$NODE_NAME" --arg s "$DOMAIN" --arg pw "$PASSWORD" --argjson p "$PORT" \
-  '{type:"anytls",tag:$n,server:$s,server_port:$p,password:$pw,
-    tls:{enabled:true,server_name:$s,utls:{enabled:true,fingerprint:"chrome"}}}')
+   '{type:"anytls",tag:$n,server:$s,server_port:$p,password:$pw,
+     tls:{enabled:true,server_name:$s,utls:{enabled:true,fingerprint:"chrome"}}}')
 
 ── 提示 ────────────────────────────────────────────────
   · 客户端只开 UDP 转发；连接复用(mux)、TCP Fast Open 必须关闭
   · 证书每日自动检查、到期前自动续期并重启 sing-box（anytls cert 可查）
-  · 管理命令： anytls {info|qr|log|cert|restart|update|uninstall}
+  · 管理命令： anytls {info|link|qr|log|cert|status|restart|update|renew|uninstall}
 ════════════════════════════════════════════════════════
 EOF
 chmod 600 "$INFO_FILE"
 
 # ---------------------------------------------------------------- 管理命令
-cat > /usr/local/bin/anytls <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-INSTALLER="\$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
-case "\${1:-info}" in
-  info)      cat $INFO_FILE ;;
-  link)      cat $LINK_FILE ;;
-  qr)        qrencode -t ANSIUTF8 < $LINK_FILE ;;
-  log)       journalctl -u sing-box -n 100 --no-pager -f ;;
-  cert)      echo "到期时间: \$(openssl x509 -in $CERT_FILE -noout -enddate | cut -d= -f2)"
-             if systemctl list-unit-files acme-renew.timer >/dev/null 2>&1; then
-               systemctl list-timers acme-renew.timer --no-pager 2>/dev/null || true
-             else
-               echo "续期方式: acme.sh crontab"; crontab -l 2>/dev/null | grep acme || true
-             fi ;;
-  restart)   systemctl restart sing-box && systemctl --no-pager status sing-box ;;
-  status)    systemctl --no-pager status sing-box ;;
-  update)    apt-get update -qq && apt-get install -y --only-upgrade sing-box && systemctl restart sing-box && sing-box version ;;
-  renew)     "$ACME" --renew -d "$DOMAIN" --ecc --force ;;
-  uninstall) systemctl disable --now sing-box acme-renew.timer 2>/dev/null || true
-             apt-get purge -y sing-box 2>/dev/null || true
-             rm -f /etc/systemd/system/acme-renew.{service,timer}
-             systemctl daemon-reload
-             rm -rf $CONF_DIR /usr/local/bin/anytls
-             echo "已卸载（acme.sh 保留，如需删除：\$HOME/.acme.sh/acme.sh --uninstall）" ;;
-  *)         echo "用法: anytls {info|link|qr|log|cert|status|restart|update|renew|uninstall}" ;;
+# FIX: 原来这里有一行 INSTALLER="$(readlink -f "${BASH_SOURCE[0]}")"，
+#      既在写入时就被展开了，又根本没被用到，直接删掉。
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  printf 'CONF_DIR=%q\n'  "$CONF_DIR"
+  printf 'INFO_FILE=%q\n' "$INFO_FILE"
+  printf 'LINK_FILE=%q\n' "$LINK_FILE"
+  printf 'CERT_FILE=%q\n' "$CERT_FILE"
+  printf 'DOMAIN=%q\n'    "$DOMAIN"
+  printf 'ACME=%q\n'      "$ACME"
+  cat <<'CLIEOF'
+case "${1:-info}" in
+  info)    cat "$INFO_FILE" ;;
+  link)    cat "$LINK_FILE" ;;
+  qr)      qrencode -t ANSIUTF8 < "$LINK_FILE" ;;
+  log)     journalctl -u sing-box -n 100 --no-pager -f ;;
+  cert)
+    echo "到期时间: $(openssl x509 -in "$CERT_FILE" -noout -enddate | cut -d= -f2)"
+    if systemctl list-unit-files acme-renew.timer >/dev/null 2>&1; then
+      systemctl list-timers acme-renew.timer --no-pager 2>/dev/null || true
+    fi
+    crontab -l 2>/dev/null | grep acme || true ;;
+  renew)   "$ACME" --renew -d "$DOMAIN" --ecc --force ;;
+  status)  systemctl --no-pager status sing-box ;;
+  restart) systemctl restart sing-box && systemctl --no-pager status sing-box ;;
+  update)  apt-get update -qq && apt-get install -y --only-upgrade sing-box \
+             && systemctl restart sing-box && sing-box version ;;
+  uninstall)
+    systemctl disable --now sing-box acme-renew.timer 2>/dev/null || true
+    apt-get purge -y sing-box 2>/dev/null || true
+    rm -f /etc/systemd/system/acme-renew.service /etc/systemd/system/acme-renew.timer
+    systemctl daemon-reload
+    rm -rf "$CONF_DIR" /usr/local/bin/anytls
+    echo "已卸载（acme.sh 保留，如需删除：$HOME/.acme.sh/acme.sh --uninstall）" ;;
+  *) echo "用法: anytls {info|link|qr|log|cert|renew|status|restart|update|uninstall}" ;;
 esac
-EOF
+CLIEOF
+} > /usr/local/bin/anytls
 chmod +x /usr/local/bin/anytls
 
 clear
