@@ -471,15 +471,47 @@ build_config() {
   [[ "$(jq 'length' <<<"$inb")" != "0" ]] || die "没有启用任何协议，拒绝写出空配置。"
 
   local tmp; tmp=$(mktemp)
-  # 内联 sniff 字段在 1.11 弃用、1.13 移除，必须写成路由规则的 action
+  # 内联 sniff 字段在 1.11 弃用、1.13 移除，必须写成路由规则的 action。
+  # 安全基线规则始终写入，与 sniff 开关无关：
+  #   · ip_is_private 用 drop 而非默认 reject，避免对私网探测原样回 RST/不可达，
+  #     让行为更接近"这地址不存在"
+  #   · tcp/25 —— 拦住 SMTP 出站，防止代理被用来群发垃圾邮件导致整机被封
+  #   · geoip-cn/geosite-cn —— 这是境外出口节点，目标是中国大陆的连接直接拒绝：
+  #     大概率被 GFW 双向拦截、访问失败或触发风控，白白消耗流量和连接数
+  # protocol=bittorrent 依赖嗅探结果，只有开启 sniff 时才有意义，跟着开关走。
   jq -n --argjson inb "$inb" --argjson sniff "${ENABLE_SNIFF:-1}" '{
     log: { level: "info", timestamp: true },
     inbounds: $inb,
-    outbounds: [{ type: "direct", tag: "direct" }]
-  }
-  + (if $sniff == 1 then
-       { route: { rules: [ { action: "sniff", timeout: "1s" } ] } }
-     else {} end)' > "$tmp"
+    outbounds: [{ type: "direct", tag: "direct" }],
+    route: {
+      rule_set: [
+        {
+          tag: "geoip-cn",
+          type: "remote",
+          format: "binary",
+          url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+          download_detour: "direct"
+        },
+        {
+          tag: "geosite-cn",
+          type: "remote",
+          format: "binary",
+          url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+          download_detour: "direct"
+        }
+      ],
+      rules: (
+        (if $sniff == 1 then [ { action: "sniff", timeout: "1s" } ] else [] end)
+        + [
+            { ip_is_private: true, action: "reject", method: "drop" },
+            { network: "tcp", port: 25, action: "reject" },
+            { rule_set: ["geoip-cn", "geosite-cn"], action: "reject" }
+          ]
+        + (if $sniff == 1 then [ { protocol: "bittorrent", action: "reject" } ] else [] end)
+      ),
+      final: "direct"
+    }
+  }' > "$tmp"
 
   if ! sing-box check -c "$tmp" 2>&1; then
     rm -f "$tmp"
@@ -628,8 +660,8 @@ EOF
   · Hysteria2 走 UDP，云厂商安全组别忘了放行对应 UDP 端口
   · 开了端口跳跃的话，安全组要放行整个 UDP 范围，不只是监听端口
   · 混淆(salamander)与 HTTP/3 伪装互斥：开了混淆，masquerade 永远不会被触发
-  · 服务端已设 ignore_client_bandwidth，统一使用 BBR，
-    客户端填不填带宽都不会启用 Brutal
+  · 服务端已内置安全基线：私网地址静默丢弃、SMTP(25端口)出站拦截、
+    目标为中国大陆的连接直接拒绝(境外出口访问大陆大概率被拦，白白耗流量)
   · 证书每日自动检查、到期自动续期并重启 sing-box
   · 管理命令： sbx {info|link|qr|log|cert|status|restart|update|menu|uninstall}
 ════════════════════════════════════════════════════════
