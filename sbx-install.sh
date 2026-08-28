@@ -475,9 +475,10 @@ build_config() {
   # 安全基线规则始终写入，与 sniff 开关无关：
   #   · ip_is_private 用 drop 而非默认 reject，避免对私网探测原样回 RST/不可达，
   #     让行为更接近"这地址不存在"
-  #   · tcp/25 —— 拦住 SMTP 出站，防止代理被用来群发垃圾邮件导致整机被封
-  #   · geoip-cn/geosite-cn —— 这是境外出口节点，目标是中国大陆的连接直接拒绝：
+  #   · geoip-cn —— 这是境外出口节点，目标是中国大陆的连接直接拒绝：
   #     大概率被 GFW 双向拦截、访问失败或触发风控，白白消耗流量和连接数
+  #     （不再叠加 geosite-cn，避免部分被境内 CDN 收录的境外域名如
+  #      gstatic.com 被误判拦截，导致测速/连通性检测失败）
   # protocol=bittorrent 依赖嗅探结果，只有开启 sniff 时才有意义，跟着开关走。
   jq -n --argjson inb "$inb" --argjson sniff "${ENABLE_SNIFF:-1}" '{
     log: { level: "info", timestamp: true },
@@ -491,21 +492,13 @@ build_config() {
           format: "binary",
           url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
           download_detour: "direct"
-        },
-        {
-          tag: "geosite-cn",
-          type: "remote",
-          format: "binary",
-          url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
-          download_detour: "direct"
         }
       ],
       rules: (
         (if $sniff == 1 then [ { action: "sniff", timeout: "1s" } ] else [] end)
         + [
             { ip_is_private: true, action: "reject", method: "drop" },
-            { network: "tcp", port: 25, action: "reject" },
-            { rule_set: ["geoip-cn", "geosite-cn"], action: "reject" }
+            { rule_set: "geoip-cn", action: "reject" }
           ]
         + (if $sniff == 1 then [ { protocol: "bittorrent", action: "reject" } ] else [] end)
       ),
